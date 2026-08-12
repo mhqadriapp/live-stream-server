@@ -6,8 +6,11 @@ const path = require('path');
 const cors = require('cors');
 
 const app = express();
+
+// CORS और टाइमआउट बफर बढ़ाएं ताकि अपलोड बीच में न टूटे
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '1000mb' }));
+app.use(express.urlencoded({ extended: true, limit: '1000mb' }));
 
 const PORT = process.env.PORT || 3000;
 
@@ -31,6 +34,7 @@ function saveVideos(videos) {
     fs.writeFileSync(DB_FILE, JSON.stringify(videos, null, 2));
 }
 
+// हाई-स्पीड बफर के साथ स्टोरेज कॉन्फ़िगरेशन
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, UPLOADS_DIR),
     filename: (req, file, cb) => {
@@ -38,19 +42,17 @@ const storage = multer.diskStorage({
         cb(null, uniqueName);
     }
 });
-const upload = multer({ storage: storage });
+
+// फ़ास्ट फाइल अपलोडर
+const upload = multer({ 
+    storage: storage,
+    limits: { fileSize: 2000 * 1024 * 1024 } // 2 GB Max File Limit
+});
 
 app.use('/uploads', express.static(UPLOADS_DIR));
 
-// मल्टीपल लाइव स्ट्रीम्स को संभालने के लिए (Multi-Stream Object)
 let activeStreams = {}; 
-/* Structure: 
-{ 
-   streamId: { process, videoId, videoName, streamKey, startTime, durationDays, endTime, isLoop, timer } 
-} 
-*/
 
-// 1. सर्वर स्टेटस सिंक (APK दोबारा खोलने पर सभी एक्टिव लाइव शो करेगा)
 app.get('/status', (req, res) => {
     const activeList = Object.keys(activeStreams).map(id => {
         const s = activeStreams[id];
@@ -74,7 +76,7 @@ app.get('/status', (req, res) => {
     });
 });
 
-// 2. वीडियो अपलोड एपीआई
+// हाई-स्पीड वीडियो अपलोड रूट
 app.post('/upload', upload.single('video'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'फाइल अपलोड नहीं हुई' });
 
@@ -91,17 +93,15 @@ app.post('/upload', upload.single('video'), (req, res) => {
     videos.push(newVideo);
     saveVideos(videos);
 
-    res.json({ message: 'वीडियो सर्वर पर अपलोड हो गया!', video: newVideo, videos });
+    res.json({ message: 'वीडियो सर्वर पर फ़ास्ट अपलोड हो गया!', video: newVideo, videos });
 });
 
-// 3. वीडियो डिलीट (रेंडर मेमोरी क्लियर)
 app.delete('/videos/:id', (req, res) => {
     const videoId = req.params.id;
     let videos = getVideos();
     const videoToDelete = videos.find(v => v.id === videoId);
 
     if (videoToDelete) {
-        // यदि इस वीडियो की लाइव स्ट्रीम चल रही है तो उसे भी बंद करें
         Object.keys(activeStreams).forEach(streamId => {
             if (activeStreams[streamId].videoId === videoId) {
                 stopStreamById(streamId);
@@ -116,14 +116,13 @@ app.delete('/videos/:id', (req, res) => {
         saveVideos(videos);
     }
 
-    res.json({ message: 'वीडियो और उससे जुड़ी स्ट्रीम्स डिलीट कर दी गईं!', videos });
+    res.json({ message: 'वीडियो डिलीट कर दिया गया!', videos });
 });
 
-// 4. इंडिविजुअल (अलग) वीडियो को लाइव ब्रॉडकास्ट करना
 app.post('/start', (req, res) => {
     const { videoId, streamKey, isLoop, durationDays } = req.body;
 
-    if (!streamKey) return res.status(400).json({ error: 'Stream Key दर्ज करें!' });
+    if (!streamKey) return res.status(400).json({ error: 'Stream Key आवश्यक है!' });
 
     const videos = getVideos();
     const selectedVideo = videos.find(v => v.id === videoId);
@@ -135,7 +134,6 @@ app.post('/start', (req, res) => {
     const streamId = 'stream_' + Date.now();
     const youtubeRTMP = `rtmp://a.rtmp.youtube.com/live2/${streamKey}`;
 
-    // FFmpeg इंडिपेंडेंट कमांड (Endless Loop सपोर्ट के साथ)
     const args = [];
     if (isLoop) {
         args.push('-stream_loop', '-1');
@@ -143,7 +141,9 @@ app.post('/start', (req, res) => {
     args.push(
         '-re',
         '-i', videoFilePath,
-        '-c:v', 'copy',
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-tune', 'zerolatency',
         '-c:a', 'aac',
         '-b:a', '128k',
         '-f', 'flv',
@@ -173,22 +173,20 @@ app.post('/start', (req, res) => {
         timer: timer
     };
 
-    ffmpegProc.on('close', (code) => {
-        console.log(`Stream ${streamId} exited with code ${code}`);
+    ffmpegProc.on('close', () => {
         delete activeStreams[streamId];
     });
 
     res.json({ message: `🔴 "${selectedVideo.originalName}" लाइव ब्रॉडकास्ट चालू हो गया!`, streamId });
 });
 
-// 5. किसी विशिष्ट (Specific) लाइव स्ट्रीम को डिस्कनेक्ट करना
 app.post('/stop', (req, res) => {
     const { streamId } = req.body;
     if (streamId) {
         stopStreamById(streamId);
-        res.json({ message: 'लाइव स्ट्रीम डिस्कनेक्ट कर दी गई है।' });
+        res.json({ message: 'लाइव ब्रॉडकास्ट डिस्कनेक्ट कर दिया गया है।' });
     } else {
-        res.status(400).json({ error: 'Stream ID की आवश्यकता है' });
+        res.status(400).json({ error: 'Stream ID नहीं मिली' });
     }
 });
 
@@ -200,4 +198,4 @@ function stopStreamById(streamId) {
     }
 }
 
-app.listen(PORT, () => console.log(`Multi-Stream Engine running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Fast Server running on port ${PORT}`));
