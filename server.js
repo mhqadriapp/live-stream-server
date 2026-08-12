@@ -11,13 +11,11 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// वीडियो सेव करने के लिए फोल्डर
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) {
     fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 }
 
-// वीडियो डेटाबेस (JSON फाइल)
 const DB_FILE = path.join(__dirname, 'videos.json');
 
 function getVideos() {
@@ -33,7 +31,6 @@ function saveVideos(videos) {
     fs.writeFileSync(DB_FILE, JSON.stringify(videos, null, 2));
 }
 
-// Multer कॉन्फ़िगरेशन
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, UPLOADS_DIR),
     filename: (req, file, cb) => {
@@ -43,36 +40,43 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage: storage });
 
-// स्टैटिक फाइल्स (अपलोडेड वीडियो देखने के लिए)
 app.use('/uploads', express.static(UPLOADS_DIR));
 
-// ग्लोबल स्टेट
-let ffmpegProcess = null;
-let autoStopTimer = null;
-let currentStreamInfo = {
-    isLive: false,
-    videoId: null,
-    videoName: '',
-    videoUrl: '',
-    startTime: null,
-    durationDays: 0,
-    endTime: null,
-    isLoop: true
-};
+// मल्टीपल लाइव स्ट्रीम्स को संभालने के लिए (Multi-Stream Object)
+let activeStreams = {}; 
+/* Structure: 
+{ 
+   streamId: { process, videoId, videoName, streamKey, startTime, durationDays, endTime, isLoop, timer } 
+} 
+*/
 
-// 1. सर्वर स्टेटस और लाइव जानकारी प्राप्त करें (APK reopen होने पर यह सिंक करेगा)
+// 1. सर्वर स्टेटस सिंक (APK दोबारा खोलने पर सभी एक्टिव लाइव शो करेगा)
 app.get('/status', (req, res) => {
-    const videos = getVideos();
+    const activeList = Object.keys(activeStreams).map(id => {
+        const s = activeStreams[id];
+        return {
+            streamId: id,
+            videoId: s.videoId,
+            videoName: s.videoName,
+            streamKey: s.streamKey,
+            startTime: s.startTime,
+            durationDays: s.durationDays,
+            endTime: s.endTime,
+            isLoop: s.isLoop,
+            videoUrl: s.videoUrl
+        };
+    });
+
     res.json({
-        streamStatus: currentStreamInfo,
-        videos: videos,
+        activeStreams: activeList,
+        serverVideos: getVideos(),
         defaultServerUrl: "https://live-stream-server-sfvs.onrender.com"
     });
 });
 
-// 2. वीडियो अपलोड एपीआई (प्रोसेसिंग के बाद लिस्ट में जोड़ेगा)
+// 2. वीडियो अपलोड एपीआई
 app.post('/upload', upload.single('video'), (req, res) => {
-    if (!req.file) return res.status(400).json({ error: 'No video file provided' });
+    if (!req.file) return res.status(400).json({ error: 'फाइल अपलोड नहीं हुई' });
 
     const videos = getVideos();
     const newVideo = {
@@ -87,46 +91,51 @@ app.post('/upload', upload.single('video'), (req, res) => {
     videos.push(newVideo);
     saveVideos(videos);
 
-    res.json({ message: 'वीडियो सफलतापूर्वक अपलोड और प्रोसेस हो गया!', video: newVideo, videos });
+    res.json({ message: 'वीडियो सर्वर पर अपलोड हो गया!', video: newVideo, videos });
 });
 
-// 3. वीडियो डिलीट करें
+// 3. वीडियो डिलीट (रेंडर मेमोरी क्लियर)
 app.delete('/videos/:id', (req, res) => {
     const videoId = req.params.id;
     let videos = getVideos();
     const videoToDelete = videos.find(v => v.id === videoId);
 
     if (videoToDelete) {
+        // यदि इस वीडियो की लाइव स्ट्रीम चल रही है तो उसे भी बंद करें
+        Object.keys(activeStreams).forEach(streamId => {
+            if (activeStreams[streamId].videoId === videoId) {
+                stopStreamById(streamId);
+            }
+        });
+
         const filePath = path.join(UPLOADS_DIR, videoToDelete.filename);
         if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
+            try { fs.unlinkSync(filePath); } catch(e) {}
         }
         videos = videos.filter(v => v.id !== videoId);
         saveVideos(videos);
     }
 
-    res.json({ message: 'वीडियो डिलीट कर दिया गया', videos });
+    res.json({ message: 'वीडियो और उससे जुड़ी स्ट्रीम्स डिलीट कर दी गईं!', videos });
 });
 
-// 4. लाइव स्ट्रीम शुरू करें
+// 4. इंडिविजुअल (अलग) वीडियो को लाइव ब्रॉडकास्ट करना
 app.post('/start', (req, res) => {
     const { videoId, streamKey, isLoop, durationDays } = req.body;
 
-    if (!streamKey) return res.status(400).json({ error: 'Stream Key आवश्यक है!' });
+    if (!streamKey) return res.status(400).json({ error: 'Stream Key दर्ज करें!' });
 
     const videos = getVideos();
     const selectedVideo = videos.find(v => v.id === videoId);
     if (!selectedVideo) return res.status(404).json({ error: 'वीडियो नहीं मिला!' });
 
     const videoFilePath = path.join(UPLOADS_DIR, selectedVideo.filename);
-    if (!fs.existsSync(videoFilePath)) return res.status(400).json({ error: 'वीडियो फाइल सर्वर पर मौजूद नहीं है' });
+    if (!fs.existsSync(videoFilePath)) return res.status(400).json({ error: 'वीडियो फाइल सर्वर पर नहीं है' });
 
-    // यदि पहले से कोई स्ट्रीम चल रही है तो उसे बंद करें
-    stopCurrentFFmpeg();
-
+    const streamId = 'stream_' + Date.now();
     const youtubeRTMP = `rtmp://a.rtmp.youtube.com/live2/${streamKey}`;
 
-    // FFmpeg कमांड आर्गुमेंट्स
+    // FFmpeg इंडिपेंडेंट कमांड (Endless Loop सपोर्ट के साथ)
     const args = [];
     if (isLoop) {
         args.push('-stream_loop', '-1');
@@ -141,66 +150,54 @@ app.post('/start', (req, res) => {
         youtubeRTMP
     );
 
-    ffmpegProcess = spawn('ffmpeg', args);
+    const ffmpegProc = spawn('ffmpeg', args);
 
     const now = Date.now();
     const daysMs = (parseInt(durationDays) || 1) * 24 * 60 * 60 * 1000;
     const endTime = now + daysMs;
 
-    currentStreamInfo = {
-        isLive: true,
+    const timer = setTimeout(() => {
+        stopStreamById(streamId);
+    }, daysMs);
+
+    activeStreams[streamId] = {
+        process: ffmpegProc,
         videoId: selectedVideo.id,
         videoName: selectedVideo.originalName,
         videoUrl: selectedVideo.path,
+        streamKey: streamKey,
         startTime: now,
         durationDays: durationDays,
         endTime: endTime,
-        isLoop: isLoop
+        isLoop: isLoop,
+        timer: timer
     };
 
-    // ऑटो-डिस्कनेक्ट टाइमर सेट करें
-    autoStopTimer = setTimeout(() => {
-        stopCurrentFFmpeg();
-        console.log(`Auto Disconnected stream after ${durationDays} days.`);
-    }, daysMs);
-
-    ffmpegProcess.on('close', (code) => {
-        console.log(`FFmpeg process exited with code ${code}`);
-        if (currentStreamInfo.isLive && code !== 0) {
-            currentStreamInfo.isLive = false;
-        }
+    ffmpegProc.on('close', (code) => {
+        console.log(`Stream ${streamId} exited with code ${code}`);
+        delete activeStreams[streamId];
     });
 
-    res.json({ message: '🔴 24x7 लाइव ब्रॉडकास्ट शुरू हो गया!', streamInfo: currentStreamInfo });
+    res.json({ message: `🔴 "${selectedVideo.originalName}" लाइव ब्रॉडकास्ट चालू हो गया!`, streamId });
 });
 
-// 5. लाइव स्ट्रीम रोकें (Disconnect)
+// 5. किसी विशिष्ट (Specific) लाइव स्ट्रीम को डिस्कनेक्ट करना
 app.post('/stop', (req, res) => {
-    stopCurrentFFmpeg();
-    res.json({ message: 'लाइव स्ट्रीम डिस्कनेक्ट कर दी गई है।' });
+    const { streamId } = req.body;
+    if (streamId) {
+        stopStreamById(streamId);
+        res.json({ message: 'लाइव स्ट्रीम डिस्कनेक्ट कर दी गई है।' });
+    } else {
+        res.status(400).json({ error: 'Stream ID की आवश्यकता है' });
+    }
 });
 
-function stopCurrentFFmpeg() {
-    if (autoStopTimer) {
-        clearTimeout(autoStopTimer);
-        autoStopTimer = null;
+function stopStreamById(streamId) {
+    if (activeStreams[streamId]) {
+        if (activeStreams[streamId].timer) clearTimeout(activeStreams[streamId].timer);
+        if (activeStreams[streamId].process) activeStreams[streamId].process.kill('SIGKILL');
+        delete activeStreams[streamId];
     }
-    if (ffmpegProcess) {
-        ffmpegProcess.kill('SIGKILL');
-        ffmpegProcess = null;
-    }
-    currentStreamInfo = {
-        isLive: false,
-        videoId: null,
-        videoName: '',
-        videoUrl: '',
-        startTime: null,
-        durationDays: 0,
-        endTime: null,
-        isLoop: true
-    };
 }
 
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Multi-Stream Engine running on port ${PORT}`));
