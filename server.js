@@ -7,7 +7,6 @@ const cors = require('cors');
 
 const app = express();
 
-// CORS और टाइमआउट बफर बढ़ाएं ताकि अपलोड बीच में न टूटे
 app.use(cors());
 app.use(express.json({ limit: '1000mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1000mb' }));
@@ -34,7 +33,6 @@ function saveVideos(videos) {
     fs.writeFileSync(DB_FILE, JSON.stringify(videos, null, 2));
 }
 
-// हाई-स्पीड बफर के साथ स्टोरेज कॉन्फ़िगरेशन
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, UPLOADS_DIR),
     filename: (req, file, cb) => {
@@ -43,11 +41,7 @@ const storage = multer.diskStorage({
     }
 });
 
-// फ़ास्ट फाइल अपलोडर
-const upload = multer({ 
-    storage: storage,
-    limits: { fileSize: 2000 * 1024 * 1024 } // 2 GB Max File Limit
-});
+const upload = multer({ storage: storage });
 
 app.use('/uploads', express.static(UPLOADS_DIR));
 
@@ -76,7 +70,6 @@ app.get('/status', (req, res) => {
     });
 });
 
-// हाई-स्पीड वीडियो अपलोड रूट
 app.post('/upload', upload.single('video'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'फाइल अपलोड नहीं हुई' });
 
@@ -93,7 +86,7 @@ app.post('/upload', upload.single('video'), (req, res) => {
     videos.push(newVideo);
     saveVideos(videos);
 
-    res.json({ message: 'वीडियो सर्वर पर फ़ास्ट अपलोड हो गया!', video: newVideo, videos });
+    res.json({ message: 'वीडियो सर्वर पर सफलतापूर्वक अपलोड हो गया!', video: newVideo, videos });
 });
 
 app.delete('/videos/:id', (req, res) => {
@@ -119,6 +112,7 @@ app.delete('/videos/:id', (req, res) => {
     res.json({ message: 'वीडियो डिलीट कर दिया गया!', videos });
 });
 
+// 🔴 यूट्यूब RTMP के लिए परफेक्ट स्मूथ लाइव ब्रॉडकास्ट इंजन
 app.post('/start', (req, res) => {
     const { videoId, streamKey, isLoop, durationDays } = req.body;
 
@@ -134,21 +128,27 @@ app.post('/start', (req, res) => {
     const streamId = 'stream_' + Date.now();
     const youtubeRTMP = `rtmp://a.rtmp.youtube.com/live2/${streamKey}`;
 
-    const args = [];
-    if (isLoop) {
-        args.push('-stream_loop', '-1');
-    }
-    args.push(
+    // FFmpeg यूट्यूब लाइव ऑप्टिमाइज़्ड आर्गुमेंट्स (Zero Buffering)
+    const args = [
         '-re',
+        ...(isLoop ? ['-stream_loop', '-1'] : []),
         '-i', videoFilePath,
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
         '-tune', 'zerolatency',
+        '-pix_fmt', 'yuv420p',
+        '-r', '30',                   // फिक्स 30 FPS
+        '-g', '60',                   // हर 2 सेकंड में Keyframe (यूट्यूब एरर फिक्स)
+        '-b:v', '2500k',              // कांस्टेंट बिटरेट
+        '-maxrate', '2500k',
+        '-bufsize', '5000k',
         '-c:a', 'aac',
         '-b:a', '128k',
+        '-ar', '44100',
+        '-flvflags', 'no_duration_filesize',
         '-f', 'flv',
         youtubeRTMP
-    );
+    ];
 
     const ffmpegProc = spawn('ffmpeg', args);
 
@@ -177,7 +177,7 @@ app.post('/start', (req, res) => {
         delete activeStreams[streamId];
     });
 
-    res.json({ message: `🔴 "${selectedVideo.originalName}" लाइव ब्रॉडकास्ट चालू हो गया!`, streamId });
+    res.json({ message: `🔴 "${selectedVideo.originalName}" स्मूथ लाइव चालू हो गया!`, streamId });
 });
 
 app.post('/stop', (req, res) => {
@@ -198,4 +198,4 @@ function stopStreamById(streamId) {
     }
 }
 
-app.listen(PORT, () => console.log(`Fast Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Optimized Server running on port ${PORT}`));
