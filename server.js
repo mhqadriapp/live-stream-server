@@ -2,21 +2,28 @@ const express = require('express');
 const multer = require('multer');
 const { spawn } = require('child_process');
 const fs = require('fs');
+const path = require('path');
 const cors = require('cors');
 
 const app = express();
 app.use(cors());
 const port = process.env.PORT || 3000;
 
+let uploadedFilePath = '';
+
+// यह WEBM और MP4 दोनों को उनके असली नाम से सेव करेगा
 const storage = multer.diskStorage({
     destination: './',
-    filename: (req, file, cb) => cb(null, 'video.mp4')
+    filename: (req, file, cb) => {
+        const ext = path.extname(file.originalname) || '.mp4';
+        uploadedFilePath = 'video' + ext;
+        cb(null, uploadedFilePath);
+    }
 });
 const upload = multer({ storage: storage });
 
 let ffmpegProcess = null;
 
-// UptimeRobot के लिए ताकि सर्वर 24/7 जागता रहे
 app.get('/ping', (req, res) => res.send('Server is awake!'));
 
 app.post('/upload', upload.single('video'), (req, res) => {
@@ -26,20 +33,27 @@ app.post('/upload', upload.single('video'), (req, res) => {
 app.post('/start', express.json(), (req, res) => {
     const { streamKey } = req.body;
     if (!streamKey) return res.status(400).json({ error: 'Stream key is required' });
-    if (!fs.existsSync('video.mp4')) return res.status(400).json({ error: 'Please upload a video first' });
+    if (!uploadedFilePath || !fs.existsSync(uploadedFilePath)) return res.status(400).json({ error: 'Please upload a video first' });
 
     if (ffmpegProcess) ffmpegProcess.kill('SIGKILL');
 
     const youtubeRTMP = `rtmp://a.rtmp.youtube.com/live2/${streamKey}`;
 
-    // -c:v copy का इस्तेमाल ताकि Render का सर्वर क्रैश न हो
+    // WEBM को YouTube के लिए H.264 में कन्वर्ट करने का अल्ट्राफास्ट कमांड
     const args = [
         '-stream_loop', '-1',
         '-re',
-        '-i', 'video.mp4',
-        '-c:v', 'copy', 
+        '-i', uploadedFilePath,
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-b:v', '2500k',
+        '-maxrate', '2500k',
+        '-bufsize', '5000k',
+        '-pix_fmt', 'yuv420p',
+        '-g', '60',
         '-c:a', 'aac',
         '-b:a', '128k',
+        '-ar', '44100',
         '-f', 'flv',
         youtubeRTMP
     ];
